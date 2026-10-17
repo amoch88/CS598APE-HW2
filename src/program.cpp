@@ -11,6 +11,8 @@
 #include <program.h>
 #include <random>
 #include <stack>
+#include <thread>
+#include <cstdlib>
 
 namespace genetic {
 
@@ -124,12 +126,36 @@ void find_batched_fitness(int n_progs, program_t d_progs, float *score,
                           const float *data, const float *y,
                           const float *sample_weights) {
 
-  std::vector<float> y_pred((uint64_t)n_rows * (uint64_t)n_progs);
-  execute(d_progs, n_rows, n_progs, data, y_pred.data());
+  // Preserve correlation batching; only row-wise losses use parallel ranges.
+  if (params.metric == metric_t::pearson || params.metric == metric_t::spearman) {
+    std::vector<float> y_pred(static_cast<size_t>(n_rows) * n_progs);
+    execute(d_progs, n_rows, n_progs, data, y_pred.data());
+    compute_metric(n_rows, n_progs, y, y_pred.data(), sample_weights, score,
+                   params);
+    return;
+  }
 
-  // Compute error
-  compute_metric(n_rows, n_progs, y, y_pred.data(), sample_weights, score,
-                 params);
+  unsigned count = std::min(4u, std::max(1u, std::thread::hardware_concurrency()));
+  if (const char *value = std::getenv("GP_THREADS")) {
+    count = std::max(1, std::atoi(value));
+  }
+  count = std::min(count, static_cast<unsigned>(std::max(1, n_progs)));
+
+  auto evaluate = [&](int first, int last) {
+    std::vector<float> y_pred(static_cast<size_t>(last - first) * n_rows);
+    execute(d_progs + first, n_rows, last - first, data, y_pred.data());
+    compute_metric(n_rows, last - first, y, y_pred.data(), sample_weights,
+                   score + first, params);
+  };
+
+  std::vector<std::thread> workers;
+  for (unsigned t = 1; t < count; ++t) {
+    workers.emplace_back(evaluate, n_progs * t / count, n_progs * (t + 1) / count);
+  }
+  evaluate(0, n_progs / count);
+  for (auto &worker : workers) {
+    worker.join();
+  }
 }
 
 void set_fitness(program &h_prog, const param &params, const int n_rows,
